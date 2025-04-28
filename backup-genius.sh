@@ -276,18 +276,27 @@ upload_via_sftp() {
     local sftp_host=$3
     local sftp_username=$4
     local sftp_password=$5
+    local sftp_route=$6
 
     log_message "INFO" "📤 Uploading backup for $project via SFTP"
 
     # Create expect script for automated SFTP
     local expect_script=$(mktemp)
+
+    # Double escape $ characters in username for expect script
+    # $ must be escaped twice: once for bash and once for expect
+    local escaped_username=$(echo "$sftp_username" | sed 's/\$/\\\$/g')
+
     cat > "$expect_script" <<EOF
 #!/usr/bin/expect -f
-spawn sftp $sftp_username@$sftp_host
+# Escape $ for expect by using \\$
+spawn sftp "$escaped_username@$sftp_host"
 expect "password:"
 send "$sftp_password\r"
 expect "sftp>"
-send "put $backup_file\r"
+send "cd \"$sftp_route\"\r"
+expect "sftp>"
+send "put \"$backup_file\"\r"
 expect "sftp>"
 send "bye\r"
 expect eof
@@ -307,7 +316,7 @@ EOF
         return 1
     fi
 
-    log_message "INFO" "✅ Backup uploaded successfully via SFTP"
+    log_message "INFO" "✅ Backup uploaded successfully via SFTP to remote path: $sftp_route"
     return 0
 }
 
@@ -437,8 +446,9 @@ perform_backup() {
         local sftp_host=$(echo "$project_json" | jq -r '.sftp_host')
         local sftp_username=$(echo "$project_json" | jq -r '.sftp_username')
         local sftp_password=$(echo "$project_json" | jq -r '.sftp_password')
+        local sftp_route=$(echo "$project_json" | jq -r '.sftp_route')
 
-        upload_via_sftp "$project" "$backup_filepath" "$sftp_host" "$sftp_username" "$sftp_password"
+        upload_via_sftp "$project" "$backup_filepath" "$sftp_host" "$sftp_username" "$sftp_password" "$sftp_route"
         local upload_status=$?
 
         # Update SQLite record with upload status
