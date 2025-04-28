@@ -60,6 +60,12 @@ check_requirements() {
             log_message "ERROR" "❌ sftp is required but not installed. Please install it."
             missing_deps=1
         fi
+
+        # Check for expect which is needed for automated SFTP uploads
+        if ! command -v expect &> /dev/null; then
+            log_message "ERROR" "❌ expect is required for SFTP automation but not installed. Please install it."
+            missing_deps=1
+        fi
     fi
 
     if [[ $missing_deps -eq 1 ]]; then
@@ -172,6 +178,25 @@ send_notification() {
         }"
 
         curl -s -H "Content-Type: application/json" -d "$payload" "$webhook_uri"
+        local curl_exit_code=$?
+
+        if [[ $curl_exit_code -ne 0 ]]; then
+            log_message "ERROR" "❌ Failed to send Microsoft Teams notification for $project. Exit code: $curl_exit_code"
+        else
+            log_message "INFO" "✅ Microsoft Teams notification sent successfully for $project"
+
+            # Update SQLite record with notification status if enabled
+            if [[ $(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE") == "true" ]]; then
+                local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
+
+                sqlite3 "$sqlite_file" <<EOF
+UPDATE backup_logs
+SET notified = 1
+WHERE project = '$project' AND status = '$status'
+ORDER BY id DESC LIMIT 1;
+EOF
+            fi
+        fi
     fi
 
     # Slack notification
@@ -206,7 +231,42 @@ send_notification() {
         }"
 
         curl -s -X POST -H "Content-Type: application/json" -d "$payload" "$webhook_uri"
+        local curl_exit_code=$?
+
+        if [[ $curl_exit_code -ne 0 ]]; then
+            log_message "ERROR" "❌ Failed to send Slack notification for $project. Exit code: $curl_exit_code"
+        else
+            log_message "INFO" "✅ Slack notification sent successfully for $project"
+
+            # Update SQLite record with notification status if enabled
+            if [[ $(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE") == "true" && $(jq -r '.msteams_enable' "$SCRIPT_DIR/$OPTIONS_FILE") == "false" ]]; then
+                local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
+
+                sqlite3 "$sqlite_file" <<EOF
+UPDATE backup_logs
+SET notified = 1
+WHERE project = '$project' AND status = '$status'
+ORDER BY id DESC LIMIT 1;
+EOF
+            fi
+        fi
     fi
+
+    # If neither Teams nor Slack is enabled but SQLite is, mark as notified
+    if [[ "$msteams_enable" == "false" && "$slack_enable" == "false" && $(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE") == "true" ]]; then
+        local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
+
+        sqlite3 "$sqlite_file" <<EOF
+UPDATE backup_logs
+SET notified = 1
+WHERE project = '$project' AND status = '$status'
+ORDER BY id DESC LIMIT 1;
+EOF
+
+        log_message "INFO" "ℹ️ No notification services enabled, marked as notified in database for $project"
+    fi
+
+    return 0
 }
 
 # 📤 Function to upload backup via SFTP
@@ -424,8 +484,18 @@ is_backup_needed() {
 
         if [[ -n "$last_backup_time" ]]; then
             # Calculate time difference in minutes
-            local last_backup_epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$last_backup_time" +%s)
+            local last_backup_epoch
             local current_epoch=$(date +%s)
+
+            # Cross-platform date conversion (works on both Linux and macOS)
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+                # macOS version
+                last_backup_epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$last_backup_time" +%s)
+            else
+                # Linux version
+                last_backup_epoch=$(date -d "$last_backup_time" +%s)
+            fi
+
             local diff_minutes=$(( (current_epoch - last_backup_epoch) / 60 ))
 
             if [[ $diff_minutes -lt $frequency ]]; then
