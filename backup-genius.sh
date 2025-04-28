@@ -45,7 +45,8 @@ check_requirements() {
     fi
 
     # Check for mysql tools if needed
-    local db_engines=$(jq -r '.[] | select(.databases != null and .databases | length > 0) | .db_engine' "$SCRIPT_DIR/$CONFIG_FILE" | sort | uniq)
+    # Only check projects with non-empty databases array
+    local db_engines=$(jq -r '.[] | select(.databases != null and (.databases | length > 0)) | .db_engine' "$SCRIPT_DIR/$CONFIG_FILE" | sort | uniq)
     if [[ "$db_engines" == *"mysql"* ]]; then
         if ! command -v mysqldump &> /dev/null; then
             log_message "ERROR" "❌ mysqldump is required but not installed. Please install it."
@@ -54,6 +55,7 @@ check_requirements() {
     fi
 
     # Check for sftp if enabled
+    # Only check projects with sftp_enable set to true
     local sftp_enabled=$(jq -r '.[] | select(.sftp_enable == true) | .project' "$SCRIPT_DIR/$CONFIG_FILE")
     if [[ -n "$sftp_enabled" ]]; then
         if ! command -v sftp &> /dev/null; then
@@ -124,9 +126,10 @@ log_to_sqlite() {
 
         log_message "INFO" "📝 Logging backup information to SQLite"
 
+        # Store timestamp in GMT-0 (UTC) format
         sqlite3 "$sqlite_file" <<EOF
 INSERT INTO backup_logs (project, timestamp, status, file_path, message)
-VALUES ('$project', datetime('now'), '$status', '$file_path', '$message');
+VALUES ('$project', datetime('now', 'utc'), '$status', '$file_path', '$message');
 EOF
 
         if [[ $? -ne 0 ]]; then
@@ -145,6 +148,27 @@ send_notification() {
     local message=$3
 
     log_message "INFO" "🔔 Sending notification for $project: $status"
+
+    # Get disk space information
+    local disk_info=$(df -h $(dirname "$SCRIPT_DIR") | tail -n 1)
+    local disk_used=$(echo "$disk_info" | awk '{print $3}')
+    local disk_avail=$(echo "$disk_info" | awk '{print $4}')
+    local disk_used_pct=$(echo "$disk_info" | awk '{print $5}')
+
+    # Get disk path for the report
+    local disk_path=$(df -h $(dirname "$SCRIPT_DIR") | tail -n 1 | awk '{print $6}')
+
+    # Check upload status from database if SQLite is enabled
+    local upload_status="N/A"
+    if [[ $(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE") == "true" ]]; then
+        local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
+        upload_status=$(sqlite3 "$sqlite_file" "SELECT uploaded FROM backup_logs WHERE project = '$project' ORDER BY id DESC LIMIT 1;")
+        if [[ "$upload_status" == "1" ]]; then
+            upload_status="Uploaded ✅"
+        elif [[ "$upload_status" == "0" ]]; then
+            upload_status="Not uploaded ❌"
+        fi
+    fi
 
     # Microsoft Teams notification
     local msteams_enable=$(jq -r '.msteams_enable' "$SCRIPT_DIR/$OPTIONS_FILE")
@@ -173,6 +197,12 @@ send_notification() {
                 }, {
                     \"name\": \"Message\",
                     \"value\": \"$message\"
+                }, {
+                    \"name\": \"SFTP Upload\",
+                    \"value\": \"$upload_status\"
+                }, {
+                    \"name\": \"Disk Space ($disk_path)\",
+                    \"value\": \"Used: $disk_used ($disk_used_pct) | Available: $disk_avail\"
                 }]
             }]
         }"
@@ -225,6 +255,14 @@ EOF
                 }, {
                     \"title\": \"Message\",
                     \"value\": \"$message\",
+                    \"short\": false
+                }, {
+                    \"title\": \"SFTP Upload\",
+                    \"value\": \"$upload_status\",
+                    \"short\": true
+                }, {
+                    \"title\": \"Disk Space ($disk_path)\",
+                    \"value\": \"Used: $disk_used ($disk_used_pct) | Available: $disk_avail\",
                     \"short\": false
                 }]
             }]
@@ -489,29 +527,86 @@ is_backup_needed() {
     if [[ "$sqlite_enable" == "true" ]]; then
         local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
 
-        # Check if we need to run the backup based on frequency (in minutes)
+        # Get the last successful backup time in UTC format
         local last_backup_time=$(sqlite3 "$sqlite_file" "SELECT datetime(timestamp) FROM backup_logs WHERE project = '$project' AND status = 'SUCCESS' ORDER BY timestamp DESC LIMIT 1;")
 
         if [[ -n "$last_backup_time" ]]; then
-            # Calculate time difference in minutes
-            local last_backup_epoch
-            local current_epoch=$(date +%s)
+            # Get current time in UTC
+            local current_time_utc
 
-            # Cross-platform date conversion (works on both Linux and macOS)
             if [[ "$OSTYPE" == "darwin"* ]]; then
-                # macOS version
-                last_backup_epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$last_backup_time" +%s)
+                # macOS version - get UTC time
+                current_time_utc=$(date -u "+%Y-%m-%d %H:%M:%S")
             else
-                # Linux version
-                last_backup_epoch=$(date -d "$last_backup_time" +%s)
+                # Linux version - get UTC time
+                current_time_utc=$(date -u "+%Y-%m-%d %H:%M:%S")
             fi
 
+            log_message "DEBUG" "🔍 Last backup time from DB (UTC): $last_backup_time"
+            log_message "DEBUG" "🔍 Current time (UTC): $current_time_utc"
+
+            # Convert times to seconds since epoch for comparison
+            local last_backup_epoch
+            local current_epoch
+
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+                # macOS version
+                last_backup_epoch=$(date -j -u -f "%Y-%m-%d %H:%M:%S" "$last_backup_time" +%s 2>/dev/null)
+                current_epoch=$(date -j -u -f "%Y-%m-%d %H:%M:%S" "$current_time_utc" +%s 2>/dev/null)
+
+                # If conversion failed, try with different format
+                if [[ $? -ne 0 ]]; then
+                    log_message "DEBUG" "🔄 Date conversion failed, trying with different approach"
+                    last_backup_time=$(echo "$last_backup_time" | sed -E 's/\.[0-9]+//') # Remove milliseconds if present
+                    last_backup_epoch=$(date -j -u -f "%Y-%m-%d %H:%M:%S" "$last_backup_time" +%s 2>/dev/null)
+
+                    # If still failing, use current time to force backup
+                    if [[ $? -ne 0 ]]; then
+                        log_message "WARNING" "⚠️ Could not parse last backup time correctly, forcing backup"
+                        return 0
+                    fi
+                fi
+            else
+                # Linux version
+                last_backup_epoch=$(date -d "$last_backup_time" +%s 2>/dev/null)
+                current_epoch=$(date -d "$current_time_utc" +%s 2>/dev/null)
+
+                # If conversion failed, use current time to force backup
+                if [[ $? -ne 0 ]]; then
+                    log_message "WARNING" "⚠️ Could not parse last backup time correctly, forcing backup"
+                    return 0
+                fi
+            fi
+
+            # Debug the epoch values
+            log_message "DEBUG" "🕒 Current epoch (UTC): $current_epoch, Last backup epoch (UTC): $last_backup_epoch"
+
+            # Check if last backup timestamp is in the future (which indicates a time issue)
+            if [[ $last_backup_epoch -gt $current_epoch ]]; then
+                log_message "WARNING" "⚠️ Last backup timestamp is in the future compared to current UTC time. Possible time synchronization issue."
+                log_message "INFO" "🔄 Forcing backup due to time inconsistency"
+                return 0
+            fi
+
+            # Calculate the time difference in minutes
             local diff_minutes=$(( (current_epoch - last_backup_epoch) / 60 ))
+
+            log_message "DEBUG" "⏱️ Time difference: $diff_minutes minutes (frequency: $frequency minutes)"
+
+            # Ensure diff_minutes is not negative
+            if [[ $diff_minutes -lt 0 ]]; then
+                log_message "WARNING" "⚠️ Calculated negative time difference ($diff_minutes). Setting to 0 to avoid errors."
+                diff_minutes=0
+            fi
 
             if [[ $diff_minutes -lt $frequency ]]; then
                 log_message "INFO" "⏱️ Skipping backup for $project. Last backup was $diff_minutes minutes ago (frequency: $frequency minutes)"
                 return 1
+            else
+                log_message "INFO" "🔄 Backup needed for $project. Last backup was $diff_minutes minutes ago (frequency: $frequency minutes)"
             fi
+        else
+            log_message "INFO" "🆕 No previous successful backups found for $project. Running first backup."
         fi
     fi
 
