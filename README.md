@@ -3,6 +3,9 @@
 ## 📝 Description
 `backup-genius` is a command-line tool designed to back up files, folders, and databases. It provides flexible configuration options and supports notifications and remote storage.
 
+## 👤 Author
+- **José Daniel Paternina** - [@josedaniel](https://x.com/josedaniel)
+
 ## ⚙️ Configuration
 
 ### Configuration Files
