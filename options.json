@@ -1,0 +1,10 @@
+{
+  "sqlite_enable": true,
+  "sqlite_file": "/var/log/backup-genius/backups.db",
+  "msteams_enable": true,
+  "msteams_webhook_uri": "https://outlook.office.com/webhook/example-webhook-url-for-teams",
+  "slack_enable": false,
+  "slack_webhook_uri": "",
+  "backup_location_folder": "/backups",
+  "delete_after_upload": true
+}

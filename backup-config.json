@@ -1,0 +1,70 @@
+[
+  {
+    "project": "website",
+    "files": [
+      "/var/www/html/config.php",
+      "/var/www/html/.htaccess"
+    ],
+    "folders": [
+      "/var/www/html/wp-content/themes/mytheme",
+      "/var/www/html/wp-content/uploads"
+    ],
+    "databases": [
+      "wordpress"
+    ],
+    "db_engine": "mysql",
+    "database-credentials": {
+      "host": "localhost",
+      "username": "dbuser",
+      "password": "dbpassword"
+    },
+    "sftp_enable": true,
+    "sftp_host": "backup.example.com",
+    "sftp_username": "backupuser",
+    "sftp_password": "sftppassword",
+    "frequency": 1440
+  },
+  {
+    "project": "app_config",
+    "files": [
+      "/opt/myapp/config.yml",
+      "/etc/nginx/sites-available/myapp.conf"
+    ],
+    "folders": [
+      "/opt/myapp/data"
+    ],
+    "databases": [],
+    "db_engine": "",
+    "database-credentials": {
+      "host": "",
+      "username": "",
+      "password": ""
+    },
+    "sftp_enable": false,
+    "sftp_host": "",
+    "sftp_username": "",
+    "sftp_password": "",
+    "frequency": 720
+  },
+  {
+    "project": "customer_db",
+    "files": [],
+    "folders": [],
+    "databases": [
+      "customers",
+      "orders",
+      "products"
+    ],
+    "db_engine": "mysql",
+    "database-credentials": {
+      "host": "db.example.com",
+      "username": "root",
+      "password": "secure_password"
+    },
+    "sftp_enable": true,
+    "sftp_host": "backup.example.com",
+    "sftp_username": "dbbackupuser",
+    "sftp_password": "dbsftppassword",
+    "frequency": 60
+  }
+]
