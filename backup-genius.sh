@@ -175,36 +175,35 @@ send_notification() {
     if [[ "$msteams_enable" == "true" ]]; then
         local webhook_uri=$(jq -r '.msteams_webhook_uri' "$SCRIPT_DIR/$OPTIONS_FILE")
 
-        # Create MS Teams message card
-        local color="ff0000"
-        if [[ "$status" == "SUCCESS" ]]; then
-            color="00ff00"
-        fi
+        # Prepare message text content with all relevant information
+        local notification_text="**Backup $status for $project**\n\n"
+        notification_text+="**Status:** $status\n"
+        notification_text+="**Time:** $(date)\n"
+        notification_text+="**Message:** $message\n"
+        notification_text+="**SFTP Upload:** $upload_status\n"
+        notification_text+="**Disk Space ($disk_path):** Used: $disk_used ($disk_used_pct) | Available: $disk_avail"
 
+        # Create Teams message in the required format
         local payload="{
-            \"@type\": \"MessageCard\",
-            \"@context\": \"http://schema.org/extensions\",
-            \"themeColor\": \"$color\",
-            \"summary\": \"Backup $status for $project\",
-            \"sections\": [{
-                \"activityTitle\": \"Backup $status for $project\",
-                \"facts\": [{
-                    \"name\": \"Status\",
-                    \"value\": \"$status\"
-                }, {
-                    \"name\": \"Time\",
-                    \"value\": \"$(date)\"
-                }, {
-                    \"name\": \"Message\",
-                    \"value\": \"$message\"
-                }, {
-                    \"name\": \"SFTP Upload\",
-                    \"value\": \"$upload_status\"
-                }, {
-                    \"name\": \"Disk Space ($disk_path)\",
-                    \"value\": \"Used: $disk_used ($disk_used_pct) | Available: $disk_avail\"
-                }]
-            }]
+            \"type\": \"message\",
+            \"attachments\": [
+                {
+                    \"contentType\": \"application/vnd.microsoft.card.adaptive\",
+                    \"contentUrl\": null,
+                    \"content\": {
+                        \"\$schema\": \"http://adaptivecards.io/schemas/adaptive-card.json\",
+                        \"type\": \"AdaptiveCard\",
+                        \"version\": \"1.2\",
+                        \"body\": [
+                            {
+                                \"type\": \"TextBlock\",
+                                \"text\": \"$notification_text\",
+                                \"wrap\": true
+                            }
+                        ]
+                    }
+                }
+            ]
         }"
 
         curl -s -H "Content-Type: application/json" -d "$payload" "$webhook_uri"
@@ -524,6 +523,12 @@ is_backup_needed() {
 
     local sqlite_enable=$(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE")
 
+    # Log current time with timezone info for better debugging
+    local current_local_time=$(date "+%Y-%m-%d %H:%M:%S %Z")
+    local current_utc_time=$(date -u "+%Y-%m-%d %H:%M:%S UTC")
+    log_message "INFO" "🕒 Current local time: $current_local_time"
+    log_message "INFO" "🕒 Current UTC time: $current_utc_time"
+
     if [[ "$sqlite_enable" == "true" ]]; then
         local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
 
@@ -531,6 +536,8 @@ is_backup_needed() {
         local last_backup_time=$(sqlite3 "$sqlite_file" "SELECT datetime(timestamp) FROM backup_logs WHERE project = '$project' AND status = 'SUCCESS' ORDER BY timestamp DESC LIMIT 1;")
 
         if [[ -n "$last_backup_time" ]]; then
+            log_message "INFO" "🕒 Last backup time from database (UTC): $last_backup_time"
+
             # Get current time in UTC
             local current_time_utc
 
