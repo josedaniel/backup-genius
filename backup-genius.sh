@@ -126,10 +126,16 @@ log_to_sqlite() {
 
         log_message "INFO" "📝 Logging backup information to SQLite"
 
-        # Store timestamp in GMT-0 (UTC) format
+        # Store timestamp explicitly in UTC format with explicit timezone
+        # This ensures SQLite does not apply any timezone offsets
+        local current_utc_timestamp=$(date -u "+%Y-%m-%d %H:%M:%S")
+
+        # Debug log to confirm we're storing UTC time
+        log_message "DEBUG" "🕒 Storing timestamp in SQLite (UTC): $current_utc_timestamp"
+
         sqlite3 "$sqlite_file" <<EOF
 INSERT INTO backup_logs (project, timestamp, status, file_path, message)
-VALUES ('$project', datetime('now', 'utc'), '$status', '$file_path', '$message');
+VALUES ('$project', '$current_utc_timestamp', '$status', '$file_path', '$message');
 EOF
 
         if [[ $? -ne 0 ]]; then
@@ -521,6 +527,12 @@ is_backup_needed() {
     local project=$1
     local frequency=$2
 
+    # If frequency is -1, always run the backup (special case for forced execution)
+    if [[ $frequency -eq -1 ]]; then
+        log_message "INFO" "🔄 Frequency set to -1, forcing backup for $project"
+        return 0
+    fi
+
     local sqlite_enable=$(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE")
 
     # Log current time with timezone info for better debugging
@@ -533,88 +545,46 @@ is_backup_needed() {
         local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
 
         # Get the last successful backup time in UTC format
-        local last_backup_time=$(sqlite3 "$sqlite_file" "SELECT datetime(timestamp) FROM backup_logs WHERE project = '$project' AND status = 'SUCCESS' ORDER BY timestamp DESC LIMIT 1;")
+        # Use simple SELECT to get the raw timestamp
+        local last_backup_time=$(sqlite3 "$sqlite_file" "SELECT timestamp FROM backup_logs WHERE project = '$project' AND status = 'SUCCESS' ORDER BY id DESC LIMIT 1;")
 
         if [[ -n "$last_backup_time" ]]; then
-            log_message "INFO" "🕒 Last backup time from database (UTC): $last_backup_time"
+            log_message "INFO" "🕒 Last backup time from database: $last_backup_time"
 
-            # Get current time in UTC
-            local current_time_utc
+            # Get current time in the same format as SQLite uses
+            local current_time_utc=$(date -u "+%Y-%m-%d %H:%M:%S")
 
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                # macOS version - get UTC time
-                current_time_utc=$(date -u "+%Y-%m-%d %H:%M:%S")
-            else
-                # Linux version - get UTC time
-                current_time_utc=$(date -u "+%Y-%m-%d %H:%M:%S")
+            # Get a more comparable version for debug
+            local last_backup_formatted=$last_backup_time
+            # Handle possible milliseconds in SQLite timestamps
+            if [[ "$last_backup_time" == *"."* ]]; then
+                last_backup_formatted=$(echo "$last_backup_time" | sed -E 's/\.[0-9]+//')
             fi
 
-            log_message "DEBUG" "🔍 Last backup time from DB (UTC): $last_backup_time"
-            log_message "DEBUG" "🔍 Current time (UTC): $current_time_utc"
+            log_message "DEBUG" "🔍 Comparing times - Last backup: $last_backup_formatted | Current: $current_time_utc"
 
-            # Convert times to seconds since epoch for comparison
-            local last_backup_epoch
-            local current_epoch
+            # Calculate the elapsed time in minutes since the last backup
+            local elapsed_minutes=$(sqlite3 "$sqlite_file" "SELECT CAST((julianday('$current_time_utc') - julianday('$last_backup_time')) * 24 * 60 AS INTEGER);")
 
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                # macOS version
-                last_backup_epoch=$(date -j -u -f "%Y-%m-%d %H:%M:%S" "$last_backup_time" +%s 2>/dev/null)
-                current_epoch=$(date -j -u -f "%Y-%m-%d %H:%M:%S" "$current_time_utc" +%s 2>/dev/null)
+            log_message "DEBUG" "⏱️ Elapsed minutes since last backup: $elapsed_minutes (frequency: $frequency minutes)"
 
-                # If conversion failed, try with different format
-                if [[ $? -ne 0 ]]; then
-                    log_message "DEBUG" "🔄 Date conversion failed, trying with different approach"
-                    last_backup_time=$(echo "$last_backup_time" | sed -E 's/\.[0-9]+//') # Remove milliseconds if present
-                    last_backup_epoch=$(date -j -u -f "%Y-%m-%d %H:%M:%S" "$last_backup_time" +%s 2>/dev/null)
-
-                    # If still failing, use current time to force backup
-                    if [[ $? -ne 0 ]]; then
-                        log_message "WARNING" "⚠️ Could not parse last backup time correctly, forcing backup"
-                        return 0
-                    fi
-                fi
-            else
-                # Linux version
-                last_backup_epoch=$(date -d "$last_backup_time" +%s 2>/dev/null)
-                current_epoch=$(date -d "$current_time_utc" +%s 2>/dev/null)
-
-                # If conversion failed, use current time to force backup
-                if [[ $? -ne 0 ]]; then
-                    log_message "WARNING" "⚠️ Could not parse last backup time correctly, forcing backup"
-                    return 0
-                fi
-            fi
-
-            # Debug the epoch values
-            log_message "DEBUG" "🕒 Current epoch (UTC): $current_epoch, Last backup epoch (UTC): $last_backup_epoch"
-
-            # Check if last backup timestamp is in the future (which indicates a time issue)
-            if [[ $last_backup_epoch -gt $current_epoch ]]; then
-                log_message "WARNING" "⚠️ Last backup timestamp is in the future compared to current UTC time. Possible time synchronization issue."
-                log_message "INFO" "🔄 Forcing backup due to time inconsistency"
-                return 0
-            fi
-
-            # Calculate the time difference in minutes
-            local diff_minutes=$(( (current_epoch - last_backup_epoch) / 60 ))
-
-            log_message "DEBUG" "⏱️ Time difference: $diff_minutes minutes (frequency: $frequency minutes)"
-
-            # Ensure diff_minutes is not negative
-            if [[ $diff_minutes -lt 0 ]]; then
-                log_message "WARNING" "⚠️ Calculated negative time difference ($diff_minutes). Setting to 0 to avoid errors."
-                diff_minutes=0
-            fi
-
-            if [[ $diff_minutes -lt $frequency ]]; then
-                log_message "INFO" "⏱️ Skipping backup for $project. Last backup was $diff_minutes minutes ago (frequency: $frequency minutes)"
+            # For frequency 0, only run if some time has passed (at least 1 minute)
+            if [[ $frequency -eq 0 && $elapsed_minutes -eq 0 ]]; then
+                log_message "INFO" "⏱️ Skipping backup for $project. Frequency is 0 and no time has elapsed since last backup."
+                return 1
+            # For any other frequency, run if the elapsed time is >= frequency
+            elif [[ $elapsed_minutes -lt $frequency ]]; then
+                local minutes_remaining=$(( frequency - elapsed_minutes ))
+                log_message "INFO" "⏱️ Skipping backup for $project. Next backup in $minutes_remaining minutes (frequency: $frequency minutes)"
                 return 1
             else
-                log_message "INFO" "🔄 Backup needed for $project. Last backup was $diff_minutes minutes ago (frequency: $frequency minutes)"
+                log_message "INFO" "🔄 Backup needed for $project. $elapsed_minutes minutes elapsed since last backup (frequency: $frequency minutes)"
             fi
         else
             log_message "INFO" "🆕 No previous successful backups found for $project. Running first backup."
         fi
+    else
+        log_message "INFO" "📊 SQLite logging disabled, running backup for $project regardless of frequency"
     fi
 
     return 0
