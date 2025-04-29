@@ -15,7 +15,11 @@ log_message() {
     local level=$1
     local message=$2
     local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-    echo "[$timestamp] [$level] $message"
+
+    # Skip DEBUG messages in console output
+    if [[ "$level" != "DEBUG" ]]; then
+        echo "[$timestamp] [$level] $message"
+    fi
 }
 
 # ✅ Function to check if required commands are available
@@ -36,12 +40,10 @@ check_requirements() {
         missing_deps=1
     fi
 
-    # Check for sqlite3 if enabled
-    if [[ $(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE") == "true" ]]; then
-        if ! command -v sqlite3 &> /dev/null; then
-            log_message "ERROR" "❌ sqlite3 is required but not installed. Please install it."
-            missing_deps=1
-        fi
+    # Check for sqlite3 - now always required
+    if ! command -v sqlite3 &> /dev/null; then
+        log_message "ERROR" "❌ sqlite3 is required but not installed. Please install it."
+        missing_deps=1
     fi
 
     # Check for mysql tools if needed
@@ -78,17 +80,14 @@ check_requirements() {
     log_message "INFO" "✅ All dependencies are installed."
 }
 
-# 📊 Function to initialize SQLite database if enabled
+# 📊 Function to initialize SQLite database
 initialize_sqlite() {
-    local sqlite_enable=$(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE")
+    local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
 
-    if [[ "$sqlite_enable" == "true" ]]; then
-        local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
+    log_message "INFO" "🔄 Inicializando base de datos SQLite en $sqlite_file"
 
-        log_message "INFO" "🔄 Initializing SQLite database at $sqlite_file"
-
-        # Create the database and table if they don't exist
-        sqlite3 "$sqlite_file" <<EOF
+    # Create the database and table if they don't exist
+    sqlite3 "$sqlite_file" <<EOF
 CREATE TABLE IF NOT EXISTS backup_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project TEXT NOT NULL,
@@ -101,13 +100,12 @@ CREATE TABLE IF NOT EXISTS backup_logs (
 );
 EOF
 
-        if [[ $? -ne 0 ]]; then
-            log_message "ERROR" "❌ Failed to initialize SQLite database."
-            return 1
-        fi
-
-        log_message "INFO" "✅ SQLite database initialized successfully."
+    if [[ $? -ne 0 ]]; then
+        log_message "ERROR" "❌ Error al inicializar la base de datos SQLite."
+        return 1
     fi
+
+    log_message "INFO" "✅ Base de datos SQLite inicializada correctamente."
 
     return 0
 }
@@ -119,30 +117,45 @@ log_to_sqlite() {
     local file_path=$3
     local message=$4
 
-    local sqlite_enable=$(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE")
+    local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
 
-    if [[ "$sqlite_enable" == "true" ]]; then
-        local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
+    # Check if the SQLite file exists and is accessible
+    if [[ ! -f "$sqlite_file" && ! -w "$(dirname "$sqlite_file")" ]]; then
+        log_message "ERROR" "❌ SQLite database file does not exist and directory is not writable: $sqlite_file"
+        return 1
+    fi
 
-        log_message "INFO" "📝 Logging backup information to SQLite"
+    log_message "INFO" "📝 Logging backup information to SQLite"
 
-        # Store timestamp explicitly in UTC format with explicit timezone
-        # This ensures SQLite does not apply any timezone offsets
-        local current_utc_timestamp=$(date -u "+%Y-%m-%d %H:%M:%S")
+    # Store timestamp explicitly in UTC format with explicit timezone
+    # This ensures SQLite does not apply any timezone offsets
+    local current_utc_timestamp=$(date -u "+%Y-%m-%d %H:%M:%S")
 
-        # Debug log to confirm we're storing UTC time
-        log_message "DEBUG" "🕒 Storing timestamp in SQLite (UTC): $current_utc_timestamp"
+    # Debug log to confirm we're storing UTC time
+    log_message "DEBUG" "🕒 Storing timestamp in SQLite (UTC): $current_utc_timestamp"
 
-        sqlite3 "$sqlite_file" <<EOF
-INSERT INTO backup_logs (project, timestamp, status, file_path, message)
-VALUES ('$project', '$current_utc_timestamp', '$status', '$file_path', '$message');
+    # Add more debug information
+    log_message "DEBUG" "📊 SQL Data: project='$project', status='$status', file_path='$file_path'"
+
+    # Ensure file path string is properly escaped for SQLite
+    local escaped_file_path=$(echo "$file_path" | sed "s/'/''/g")
+    local escaped_message=$(echo "$message" | sed "s/'/''/g")
+
+    # Insert record with explicit column names to avoid any issues
+    sqlite3 "$sqlite_file" <<EOF
+INSERT INTO backup_logs (project, timestamp, status, file_path, message, uploaded, notified)
+VALUES ('$project', '$current_utc_timestamp', '$status', '$escaped_file_path', '$escaped_message', 0, 0);
 EOF
 
-        if [[ $? -ne 0 ]]; then
-            log_message "ERROR" "❌ Failed to log to SQLite database."
-            return 1
-        fi
+    local insert_result=$?
+    if [[ $insert_result -ne 0 ]]; then
+        log_message "ERROR" "❌ Failed to log to SQLite database. Error code: $insert_result"
+        return 1
     fi
+
+    # Verify the record was inserted
+    local record_count=$(sqlite3 "$sqlite_file" "SELECT COUNT(*) FROM backup_logs WHERE project = '$project' AND file_path = '$escaped_file_path';")
+    log_message "INFO" "✅ SQLite record inserted successfully. Record count: $record_count"
 
     return 0
 }
@@ -152,42 +165,26 @@ send_notification() {
     local project=$1
     local status=$2
     local message=$3
+    local file_path=$4  # Adding file_path parameter to identify specific backup file
 
-    log_message "INFO" "🔔 Sending notification for $project: $status"
-
-    # Get disk space information
-    local disk_info=$(df -h $(dirname "$SCRIPT_DIR") | tail -n 1)
-    local disk_used=$(echo "$disk_info" | awk '{print $3}')
-    local disk_avail=$(echo "$disk_info" | awk '{print $4}')
-    local disk_used_pct=$(echo "$disk_info" | awk '{print $5}')
-
-    # Get disk path for the report
-    local disk_path=$(df -h $(dirname "$SCRIPT_DIR") | tail -n 1 | awk '{print $6}')
-
-    # Check upload status from database if SQLite is enabled
-    local upload_status="N/A"
-    if [[ $(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE") == "true" ]]; then
-        local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
-        upload_status=$(sqlite3 "$sqlite_file" "SELECT uploaded FROM backup_logs WHERE project = '$project' ORDER BY id DESC LIMIT 1;")
-        if [[ "$upload_status" == "1" ]]; then
-            upload_status="Uploaded ✅"
-        elif [[ "$upload_status" == "0" ]]; then
-            upload_status="Not uploaded ❌"
-        fi
-    fi
+    log_message "INFO" "🔔 Enviando notificación para $project: $status"
 
     # Microsoft Teams notification
     local msteams_enable=$(jq -r '.msteams_enable' "$SCRIPT_DIR/$OPTIONS_FILE")
     if [[ "$msteams_enable" == "true" ]]; then
         local webhook_uri=$(jq -r '.msteams_webhook_uri' "$SCRIPT_DIR/$OPTIONS_FILE")
 
+        # Add status emoji
+        local status_emoji="🔴"
+        if [[ "$status" == "SUCCESS" ]]; then
+            status_emoji="✅"
+        fi
+
         # Prepare message text content with all relevant information
-        local notification_text="**Backup $status for $project**\n\n"
-        notification_text+="**Status:** $status\n"
-        notification_text+="**Time:** $(date)\n"
-        notification_text+="**Message:** $message\n"
-        notification_text+="**SFTP Upload:** $upload_status\n"
-        notification_text+="**Disk Space ($disk_path):** Used: $disk_used ($disk_used_pct) | Available: $disk_avail"
+        local notification_text="## 🔄 Backup $status for $project\n\n"
+        notification_text+="**Status:** $status_emoji $status\n"
+        notification_text+="**⏰ Time:** $(date)\n"
+        notification_text+="**📝 Message:** $message\n"
 
         # Create Teams message in the required format
         local payload="{
@@ -216,14 +213,18 @@ send_notification() {
         local curl_exit_code=$?
 
         if [[ $curl_exit_code -ne 0 ]]; then
-            log_message "ERROR" "❌ Failed to send Microsoft Teams notification for $project. Exit code: $curl_exit_code"
+            log_message "ERROR" "❌ Error al enviar notificación de Microsoft Teams para $project. Exit code: $curl_exit_code"
         else
-            log_message "INFO" "✅ Microsoft Teams notification sent successfully for $project"
+            log_message "INFO" "✅ Notificación de Microsoft Teams enviada correctamente para $project"
 
-            # Update SQLite record with notification status if enabled
-            if [[ $(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE") == "true" ]]; then
-                local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
-
+            # Update SQLite record with notification status
+            if [[ -n "$file_path" ]]; then
+                sqlite3 "$sqlite_file" <<EOF
+UPDATE backup_logs
+SET notified = 1
+WHERE project = '$project' AND file_path = '$file_path';
+EOF
+            else
                 sqlite3 "$sqlite_file" <<EOF
 UPDATE backup_logs
 SET notified = 1
@@ -241,33 +242,27 @@ EOF
 
         # Create Slack message
         local color="danger"
+        local status_emoji="🔴"
         if [[ "$status" == "SUCCESS" ]]; then
             color="good"
+            status_emoji="✅"
         fi
 
         local payload="{
             \"attachments\": [{
                 \"color\": \"$color\",
-                \"pretext\": \"Backup $status for $project\",
+                \"pretext\": \"🔄 Backup $status for $project\",
                 \"fields\": [{
                     \"title\": \"Status\",
-                    \"value\": \"$status\",
+                    \"value\": \"$status_emoji $status\",
                     \"short\": true
                 }, {
-                    \"title\": \"Time\",
+                    \"title\": \"⏰ Time\",
                     \"value\": \"$(date)\",
                     \"short\": true
                 }, {
-                    \"title\": \"Message\",
+                    \"title\": \"📝 Message\",
                     \"value\": \"$message\",
-                    \"short\": false
-                }, {
-                    \"title\": \"SFTP Upload\",
-                    \"value\": \"$upload_status\",
-                    \"short\": true
-                }, {
-                    \"title\": \"Disk Space ($disk_path)\",
-                    \"value\": \"Used: $disk_used ($disk_used_pct) | Available: $disk_avail\",
                     \"short\": false
                 }]
             }]
@@ -277,28 +272,32 @@ EOF
         local curl_exit_code=$?
 
         if [[ $curl_exit_code -ne 0 ]]; then
-            log_message "ERROR" "❌ Failed to send Slack notification for $project. Exit code: $curl_exit_code"
+            log_message "ERROR" "❌ Error al enviar notificación de Slack para $project. Exit code: $curl_exit_code"
         else
-            log_message "INFO" "✅ Slack notification sent successfully for $project"
+            log_message "INFO" "✅ Notificación de Slack enviada correctamente para $project"
 
-            # Update SQLite record with notification status if enabled
-            if [[ $(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE") == "true" && $(jq -r '.msteams_enable' "$SCRIPT_DIR/$OPTIONS_FILE") == "false" ]]; then
-                local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
-
-                sqlite3 "$sqlite_file" <<EOF
+            # Update SQLite record with notification status if MS Teams is not enabled
+            if [[ "$msteams_enable" == "false" ]]; then
+                if [[ -n "$file_path" ]]; then
+                    sqlite3 "$sqlite_file" <<EOF
+UPDATE backup_logs
+SET notified = 1
+WHERE project = '$project' AND file_path = '$file_path';
+EOF
+                else
+                    sqlite3 "$sqlite_file" <<EOF
 UPDATE backup_logs
 SET notified = 1
 WHERE project = '$project' AND status = '$status'
 ORDER BY id DESC LIMIT 1;
 EOF
+                fi
             fi
         fi
     fi
 
-    # If neither Teams nor Slack is enabled but SQLite is, mark as notified
-    if [[ "$msteams_enable" == "false" && "$slack_enable" == "false" && $(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE") == "true" ]]; then
-        local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
-
+    # If neither Teams nor Slack is enabled, mark as notified in database
+    if [[ "$msteams_enable" == "false" && "$slack_enable" == "false" ]]; then
         sqlite3 "$sqlite_file" <<EOF
 UPDATE backup_logs
 SET notified = 1
@@ -306,7 +305,7 @@ WHERE project = '$project' AND status = '$status'
 ORDER BY id DESC LIMIT 1;
 EOF
 
-        log_message "INFO" "ℹ️ No notification services enabled, marked as notified in database for $project"
+        log_message "INFO" "ℹ️ No hay servicios de notificación habilitados, marcado como notificado en la base de datos para $project"
     fi
 
     return 0
@@ -474,7 +473,7 @@ perform_backup() {
         log_message "ERROR" "❌ Failed to create backup archive"
         rm -rf "$temp_dir"
         log_to_sqlite "$project" "FAILED" "$backup_filepath" "Failed to create backup archive"
-        send_notification "$project" "FAILED" "Failed to create backup archive"
+        send_notification "$project" "FAILED" "Failed to create backup archive" "$backup_filepath"
         return 1
     fi
 
@@ -495,15 +494,23 @@ perform_backup() {
         local upload_status=$?
 
         # Update SQLite record with upload status
-        if [[ $(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE") == "true" ]]; then
-            local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
+        local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
 
-            sqlite3 "$sqlite_file" <<EOF
-UPDATE backup_logs
-SET uploaded = $([[ $upload_status -eq 0 ]] && echo 1 || echo 0)
-WHERE project = '$project' AND file_path = '$backup_filepath';
-EOF
+        # Set the uploaded flag correctly in database
+        if [[ $upload_status -eq 0 ]]; then
+            log_message "INFO" "✅ Updating SQLite record: upload successful for $backup_filepath"
+            sqlite3 "$sqlite_file" "UPDATE backup_logs SET uploaded = 1 WHERE project = '$project' AND file_path = '$backup_filepath';"
+        else
+            log_message "INFO" "⚠️ Updating SQLite record: upload failed for $backup_filepath"
+            sqlite3 "$sqlite_file" "UPDATE backup_logs SET uploaded = 0 WHERE project = '$project' AND file_path = '$backup_filepath';"
         fi
+
+        # Small delay to ensure SQLite update completes
+        sleep 1
+
+        # Verify the update was successful by reading back the value
+        local verify_upload=$(sqlite3 "$sqlite_file" "SELECT uploaded FROM backup_logs WHERE project = '$project' AND file_path = '$backup_filepath';")
+        log_message "INFO" "🔍 Verified upload status in SQLite: $([ "$verify_upload" == "1" ] && echo "Uploaded ✅" || echo "Not uploaded ❌")"
 
         # Delete backup file after upload if configured
         if [[ $upload_status -eq 0 && $(jq -r '.delete_after_upload' "$SCRIPT_DIR/$OPTIONS_FILE") == "true" ]]; then
@@ -516,7 +523,7 @@ EOF
     log_to_sqlite "$project" "SUCCESS" "$backup_filepath" "Backup completed successfully"
 
     # Send notification
-    send_notification "$project" "SUCCESS" "Backup completed successfully"
+    send_notification "$project" "SUCCESS" "Backup completed successfully" "$backup_filepath"
 
     log_message "INFO" "✅ Backup process completed for project: $project"
     return 0
@@ -529,62 +536,56 @@ is_backup_needed() {
 
     # If frequency is -1, always run the backup (special case for forced execution)
     if [[ $frequency -eq -1 ]]; then
-        log_message "INFO" "🔄 Frequency set to -1, forcing backup for $project"
+        log_message "INFO" "🔄 Frecuencia establecida en -1, forzando respaldo para $project"
         return 0
     fi
-
-    local sqlite_enable=$(jq -r '.sqlite_enable' "$SCRIPT_DIR/$OPTIONS_FILE")
 
     # Log current time with timezone info for better debugging
     local current_local_time=$(date "+%Y-%m-%d %H:%M:%S %Z")
     local current_utc_time=$(date -u "+%Y-%m-%d %H:%M:%S UTC")
-    log_message "INFO" "🕒 Current local time: $current_local_time"
-    log_message "INFO" "🕒 Current UTC time: $current_utc_time"
+    log_message "INFO" "🕒 Hora local actual: $current_local_time"
+    log_message "INFO" "🕒 Hora UTC actual: $current_utc_time"
 
-    if [[ "$sqlite_enable" == "true" ]]; then
-        local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
+    local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
 
-        # Get the last successful backup time in UTC format
-        # Use simple SELECT to get the raw timestamp
-        local last_backup_time=$(sqlite3 "$sqlite_file" "SELECT timestamp FROM backup_logs WHERE project = '$project' AND status = 'SUCCESS' ORDER BY id DESC LIMIT 1;")
+    # Get the last successful backup time in UTC format
+    # Use simple SELECT to get the raw timestamp
+    local last_backup_time=$(sqlite3 "$sqlite_file" "SELECT timestamp FROM backup_logs WHERE project = '$project' AND status = 'SUCCESS' ORDER BY id DESC LIMIT 1;")
 
-        if [[ -n "$last_backup_time" ]]; then
-            log_message "INFO" "🕒 Last backup time from database: $last_backup_time"
+    if [[ -n "$last_backup_time" ]]; then
+        log_message "INFO" "🕒 Última hora de respaldo desde la base de datos: $last_backup_time"
 
-            # Get current time in the same format as SQLite uses
-            local current_time_utc=$(date -u "+%Y-%m-%d %H:%M:%S")
+        # Get current time in the same format as SQLite uses
+        local current_time_utc=$(date -u "+%Y-%m-%d %H:%M:%S")
 
-            # Get a more comparable version for debug
-            local last_backup_formatted=$last_backup_time
-            # Handle possible milliseconds in SQLite timestamps
-            if [[ "$last_backup_time" == *"."* ]]; then
-                last_backup_formatted=$(echo "$last_backup_time" | sed -E 's/\.[0-9]+//')
-            fi
+        # Get a more comparable version for debug
+        local last_backup_formatted=$last_backup_time
+        # Handle possible milliseconds in SQLite timestamps
+        if [[ "$last_backup_time" == *"."* ]]; then
+            last_backup_formatted=$(echo "$last_backup_time" | sed -E 's/\.[0-9]+//')
+        fi
 
-            log_message "DEBUG" "🔍 Comparing times - Last backup: $last_backup_formatted | Current: $current_time_utc"
+        log_message "DEBUG" "🔍 Comparando tiempos - Último respaldo: $last_backup_formatted | Actual: $current_time_utc"
 
-            # Calculate the elapsed time in minutes since the last backup
-            local elapsed_minutes=$(sqlite3 "$sqlite_file" "SELECT CAST((julianday('$current_time_utc') - julianday('$last_backup_time')) * 24 * 60 AS INTEGER);")
+        # Calculate the elapsed time in minutes since the last backup
+        local elapsed_minutes=$(sqlite3 "$sqlite_file" "SELECT CAST((julianday('$current_time_utc') - julianday('$last_backup_time')) * 24 * 60 AS INTEGER);")
 
-            log_message "DEBUG" "⏱️ Elapsed minutes since last backup: $elapsed_minutes (frequency: $frequency minutes)"
+        log_message "DEBUG" "⏱️ Minutos transcurridos desde el último respaldo: $elapsed_minutes (frecuencia: $frequency minutos)"
 
-            # For frequency 0, only run if some time has passed (at least 1 minute)
-            if [[ $frequency -eq 0 && $elapsed_minutes -eq 0 ]]; then
-                log_message "INFO" "⏱️ Skipping backup for $project. Frequency is 0 and no time has elapsed since last backup."
-                return 1
-            # For any other frequency, run if the elapsed time is >= frequency
-            elif [[ $elapsed_minutes -lt $frequency ]]; then
-                local minutes_remaining=$(( frequency - elapsed_minutes ))
-                log_message "INFO" "⏱️ Skipping backup for $project. Next backup in $minutes_remaining minutes (frequency: $frequency minutes)"
-                return 1
-            else
-                log_message "INFO" "🔄 Backup needed for $project. $elapsed_minutes minutes elapsed since last backup (frequency: $frequency minutes)"
-            fi
+        # For frequency 0, only run if some time has passed (at least 1 minute)
+        if [[ $frequency -eq 0 && $elapsed_minutes -eq 0 ]]; then
+            log_message "INFO" "⏱️ Omitiendo respaldo para $project. La frecuencia es 0 y no ha transcurrido tiempo desde el último respaldo."
+            return 1
+        # For any other frequency, run if the elapsed time is >= frequency
+        elif [[ $elapsed_minutes -lt $frequency ]]; then
+            local minutes_remaining=$(( frequency - elapsed_minutes ))
+            log_message "INFO" "⏱️ Omitiendo respaldo para $project. Próximo respaldo en $minutes_remaining minutos (frecuencia: $frequency minutos)"
+            return 1
         else
-            log_message "INFO" "🆕 No previous successful backups found for $project. Running first backup."
+            log_message "INFO" "🔄 Respaldo necesario para $project. $elapsed_minutes minutos transcurridos desde el último respaldo (frecuencia: $frequency minutos)"
         fi
     else
-        log_message "INFO" "📊 SQLite logging disabled, running backup for $project regardless of frequency"
+        log_message "INFO" "🆕 No se encontraron respaldos exitosos previos para $project. Ejecutando el primer respaldo."
     fi
 
     return 0
