@@ -84,7 +84,7 @@ check_requirements() {
 initialize_sqlite() {
     local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
 
-    log_message "INFO" "🔄 Inicializando base de datos SQLite en $sqlite_file"
+    log_message "INFO" "🔄 Initializing SQLite database at $sqlite_file"
 
     # Create the database and table if they don't exist
     sqlite3 "$sqlite_file" <<EOF
@@ -101,11 +101,11 @@ CREATE TABLE IF NOT EXISTS backup_logs (
 EOF
 
     if [[ $? -ne 0 ]]; then
-        log_message "ERROR" "❌ Error al inicializar la base de datos SQLite."
+        log_message "ERROR" "❌ Error initializing SQLite database."
         return 1
     fi
 
-    log_message "INFO" "✅ Base de datos SQLite inicializada correctamente."
+    log_message "INFO" "✅ SQLite database initialized successfully."
 
     return 0
 }
@@ -167,7 +167,20 @@ send_notification() {
     local message=$3
     local file_path=$4  # Adding file_path parameter to identify specific backup file
 
-    log_message "INFO" "🔔 Enviando notificación para $project: $status"
+    log_message "INFO" "🔔 Sending notification for $project: $status"
+
+    # Get SFTP upload status from SQLite database
+    local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
+    local upload_status="Not uploaded ❌"
+
+    if [[ -n "$file_path" ]]; then
+        local uploaded=$(sqlite3 "$sqlite_file" "SELECT uploaded FROM backup_logs WHERE project = '$project' AND file_path = '$file_path' ORDER BY id DESC LIMIT 1;")
+        if [[ "$uploaded" == "1" ]]; then
+            upload_status="Uploaded ✅"
+        fi
+    fi
+
+    log_message "INFO" "📊 SFTP status for notification: $upload_status"
 
     # Microsoft Teams notification
     local msteams_enable=$(jq -r '.msteams_enable' "$SCRIPT_DIR/$OPTIONS_FILE")
@@ -185,6 +198,7 @@ send_notification() {
         notification_text+="**Status:** $status_emoji $status\n"
         notification_text+="**⏰ Time:** $(date)\n"
         notification_text+="**📝 Message:** $message\n"
+        notification_text+="**📤 SFTP Upload:** $upload_status\n"
 
         # Create Teams message in the required format
         local payload="{
@@ -213,25 +227,9 @@ send_notification() {
         local curl_exit_code=$?
 
         if [[ $curl_exit_code -ne 0 ]]; then
-            log_message "ERROR" "❌ Error al enviar notificación de Microsoft Teams para $project. Exit code: $curl_exit_code"
+            log_message "ERROR" "❌ Error sending Microsoft Teams notification for $project. Exit code: $curl_exit_code"
         else
-            log_message "INFO" "✅ Notificación de Microsoft Teams enviada correctamente para $project"
-
-            # Update SQLite record with notification status
-            if [[ -n "$file_path" ]]; then
-                sqlite3 "$sqlite_file" <<EOF
-UPDATE backup_logs
-SET notified = 1
-WHERE project = '$project' AND file_path = '$file_path';
-EOF
-            else
-                sqlite3 "$sqlite_file" <<EOF
-UPDATE backup_logs
-SET notified = 1
-WHERE project = '$project' AND status = '$status'
-ORDER BY id DESC LIMIT 1;
-EOF
-            fi
+            log_message "INFO" "✅ Microsoft Teams notification sent successfully for $project"
         fi
     fi
 
@@ -264,6 +262,10 @@ EOF
                     \"title\": \"📝 Message\",
                     \"value\": \"$message\",
                     \"short\": false
+                }, {
+                    \"title\": \"📤 SFTP Upload\",
+                    \"value\": \"$upload_status\",
+                    \"short\": true
                 }]
             }]
         }"
@@ -272,40 +274,10 @@ EOF
         local curl_exit_code=$?
 
         if [[ $curl_exit_code -ne 0 ]]; then
-            log_message "ERROR" "❌ Error al enviar notificación de Slack para $project. Exit code: $curl_exit_code"
+            log_message "ERROR" "❌ Error sending Slack notification for $project. Exit code: $curl_exit_code"
         else
-            log_message "INFO" "✅ Notificación de Slack enviada correctamente para $project"
-
-            # Update SQLite record with notification status if MS Teams is not enabled
-            if [[ "$msteams_enable" == "false" ]]; then
-                if [[ -n "$file_path" ]]; then
-                    sqlite3 "$sqlite_file" <<EOF
-UPDATE backup_logs
-SET notified = 1
-WHERE project = '$project' AND file_path = '$file_path';
-EOF
-                else
-                    sqlite3 "$sqlite_file" <<EOF
-UPDATE backup_logs
-SET notified = 1
-WHERE project = '$project' AND status = '$status'
-ORDER BY id DESC LIMIT 1;
-EOF
-                fi
-            fi
+            log_message "INFO" "✅ Slack notification sent successfully for $project"
         fi
-    fi
-
-    # If neither Teams nor Slack is enabled, mark as notified in database
-    if [[ "$msteams_enable" == "false" && "$slack_enable" == "false" ]]; then
-        sqlite3 "$sqlite_file" <<EOF
-UPDATE backup_logs
-SET notified = 1
-WHERE project = '$project' AND status = '$status'
-ORDER BY id DESC LIMIT 1;
-EOF
-
-        log_message "INFO" "ℹ️ No hay servicios de notificación habilitados, marcado como notificado en la base de datos para $project"
     fi
 
     return 0
@@ -465,7 +437,7 @@ perform_backup() {
         fi
     fi
 
-    # Create zip archive
+    # 1. Create zip archive
     log_message "INFO" "🗜️ Creating zip archive"
     (cd "$temp_dir" && zip -r "$backup_filepath" .)
 
@@ -482,7 +454,11 @@ perform_backup() {
     # Clean up temporary directory
     rm -rf "$temp_dir"
 
-    # Upload via SFTP if enabled
+    # 2. Log successful backup to SQLite
+    log_to_sqlite "$project" "SUCCESS" "$backup_filepath" "Backup completed successfully"
+    log_message "INFO" "📝 Backup record saved to SQLite database"
+
+    # 3. Upload via SFTP if enabled
     local sftp_enable=$(echo "$project_json" | jq -r '.sftp_enable')
     if [[ "$sftp_enable" == "true" ]]; then
         local sftp_host=$(echo "$project_json" | jq -r '.sftp_host')
@@ -519,11 +495,9 @@ perform_backup() {
         fi
     fi
 
-    # Log success to SQLite
-    log_to_sqlite "$project" "SUCCESS" "$backup_filepath" "Backup completed successfully"
-
-    # Send notification
+    # 4. Send notification
     send_notification "$project" "SUCCESS" "Backup completed successfully" "$backup_filepath"
+    log_message "INFO" "🔔 Notification sent for completed backup"
 
     log_message "INFO" "✅ Backup process completed for project: $project"
     return 0
@@ -536,15 +510,15 @@ is_backup_needed() {
 
     # If frequency is -1, always run the backup (special case for forced execution)
     if [[ $frequency -eq -1 ]]; then
-        log_message "INFO" "🔄 Frecuencia establecida en -1, forzando respaldo para $project"
+        log_message "INFO" "🔄 Frequency set to -1, forcing backup for $project"
         return 0
     fi
 
     # Log current time with timezone info for better debugging
     local current_local_time=$(date "+%Y-%m-%d %H:%M:%S %Z")
     local current_utc_time=$(date -u "+%Y-%m-%d %H:%M:%S UTC")
-    log_message "INFO" "🕒 Hora local actual: $current_local_time"
-    log_message "INFO" "🕒 Hora UTC actual: $current_utc_time"
+    log_message "INFO" "⏰ Current local time: $current_local_time"
+    log_message "INFO" "⏰ Current UTC time: $current_utc_time"
 
     local sqlite_file=$(jq -r '.sqlite_file' "$SCRIPT_DIR/$OPTIONS_FILE")
 
@@ -553,7 +527,7 @@ is_backup_needed() {
     local last_backup_time=$(sqlite3 "$sqlite_file" "SELECT timestamp FROM backup_logs WHERE project = '$project' AND status = 'SUCCESS' ORDER BY id DESC LIMIT 1;")
 
     if [[ -n "$last_backup_time" ]]; then
-        log_message "INFO" "🕒 Última hora de respaldo desde la base de datos: $last_backup_time"
+        log_message "INFO" "⏰ Last backup time from database: $last_backup_time"
 
         # Get current time in the same format as SQLite uses
         local current_time_utc=$(date -u "+%Y-%m-%d %H:%M:%S")
@@ -565,27 +539,27 @@ is_backup_needed() {
             last_backup_formatted=$(echo "$last_backup_time" | sed -E 's/\.[0-9]+//')
         fi
 
-        log_message "DEBUG" "🔍 Comparando tiempos - Último respaldo: $last_backup_formatted | Actual: $current_time_utc"
+        log_message "DEBUG" "🔍 Comparing times - Last backup: $last_backup_formatted | Current: $current_time_utc"
 
         # Calculate the elapsed time in minutes since the last backup
         local elapsed_minutes=$(sqlite3 "$sqlite_file" "SELECT CAST((julianday('$current_time_utc') - julianday('$last_backup_time')) * 24 * 60 AS INTEGER);")
 
-        log_message "DEBUG" "⏱️ Minutos transcurridos desde el último respaldo: $elapsed_minutes (frecuencia: $frequency minutos)"
+        log_message "DEBUG" "⏰ Minutes elapsed since last backup: $elapsed_minutes (frequency: $frequency minutes)"
 
         # For frequency 0, only run if some time has passed (at least 1 minute)
         if [[ $frequency -eq 0 && $elapsed_minutes -eq 0 ]]; then
-            log_message "INFO" "⏱️ Omitiendo respaldo para $project. La frecuencia es 0 y no ha transcurrido tiempo desde el último respaldo."
+            log_message "INFO" "⏰ Skipping backup for $project. Frequency is 0 and no time has elapsed since last backup."
             return 1
         # For any other frequency, run if the elapsed time is >= frequency
         elif [[ $elapsed_minutes -lt $frequency ]]; then
             local minutes_remaining=$(( frequency - elapsed_minutes ))
-            log_message "INFO" "⏱️ Omitiendo respaldo para $project. Próximo respaldo en $minutes_remaining minutos (frecuencia: $frequency minutos)"
+            log_message "INFO" "⏰ Skipping backup for $project. Next backup in $minutes_remaining minutes (frequency: $frequency minutes)"
             return 1
         else
-            log_message "INFO" "🔄 Respaldo necesario para $project. $elapsed_minutes minutos transcurridos desde el último respaldo (frecuencia: $frequency minutos)"
+            log_message "INFO" "🔄 Backup needed for $project. $elapsed_minutes minutes elapsed since last backup (frequency: $frequency minutes)"
         fi
     else
-        log_message "INFO" "🆕 No se encontraron respaldos exitosos previos para $project. Ejecutando el primer respaldo."
+        log_message "INFO" "🆕 No previous successful backups found for $project. Running first backup."
     fi
 
     return 0
