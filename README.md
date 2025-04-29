@@ -27,6 +27,36 @@ This file defines the backup projects. Each project includes:
 - **sftp_password**: SFTP server password.
 - **frecuency**: Frequency in minutes between backups.
 
+##### Example Configuration:
+```json
+[
+  {
+    "project": "my_website",
+    "files": [
+      "/var/www/html/wp-config.php",
+      "/etc/nginx/sites-available/my-site.conf"
+    ],
+    "folders": [
+      "/var/www/html/wp-content/uploads"
+    ],
+    "databases": [
+      "wordpress_db"
+    ],
+    "db_engine": "mysql",
+    "database-credentials": {
+      "host": "localhost",
+      "username": "db_user",
+      "password": "secure_password"
+    },
+    "sftp_enable": true,
+    "sftp_host": "backup.example.com",
+    "sftp_username": "backup_user",
+    "sftp_password": "sftp_password",
+    "frecuency": 1440
+  }
+]
+```
+
 #### `options.json`
 This file defines general options for the backup process:
 - **sqlite_enable**: Enable or disable logging in a local SQLite database.
@@ -38,9 +68,23 @@ This file defines general options for the backup process:
 - **backup_location_folder**: Absolute path where backups will be stored.
 - **delete_after_upload**: Delete the backup file after it is uploaded and logged.
 
+##### Example Configuration:
+```json
+{
+  "sqlite_enable": true,
+  "sqlite_file": "/var/log/backup-genius/backups.db",
+  "msteams_enable": true,
+  "msteams_webhook_uri": "https://outlook.office.com/webhook/...",
+  "slack_enable": false,
+  "slack_webhook_uri": "",
+  "backup_location_folder": "/var/backups/backup-genius",
+  "delete_after_upload": true
+}
+```
+
 ## 🔄 Backup Logic
 1. For each entry in `backup-config.json`, a ZIP file is created containing the configured files, folders, and databases.
-2. The ZIP files are named using the project name and a timestamp.
+2. The ZIP files are named using the project name and a timestamp (e.g., `my_website_2025-04-28_132045.zip`).
 3. The ZIP files are stored in the configured location.
 4. Backup files are deleted only after:
    - Being successfully uploaded.
@@ -48,6 +92,18 @@ This file defines general options for the backup process:
    - Logged in the SQLite database (if enabled).
 
 ## 🚀 Installation
+
+### Quick Start Guide
+
+1. Clone or download this repository to your server
+2. Make the script executable:
+   ```bash
+   chmod +x backup-genius.sh
+   ```
+3. Install required dependencies (see Requirements section)
+4. Configure your backup projects in `backup-config.json`
+5. Configure general options in `options.json`
+6. Set up a cron job to run the script regularly
 
 ### Setting Up Cron
 To ensure the script runs automatically, you need to add an entry to your `cron` jobs. This will execute the script every minute.
@@ -104,9 +160,32 @@ sudo yum install jq zip curl sqlite mysql-client expect
 ## 📋 Usage
 1. Configure the `backup-config.json` and `options.json` files according to your needs.
 2. Ensure the cron job is set up to run the script automatically.
+3. To run the script manually for testing:
+   ```bash
+   ./backup-genius.sh
+   ```
+
+## 💡 Tips and Troubleshooting
+
+### Log Files
+The script creates log files in the backup location folder. Check these logs if you encounter any issues.
+
+### Common Issues
+- **Permission errors**: Ensure the script has necessary permissions to access all files and folders.
+- **MySQL connection issues**: Verify database credentials and that the mysql-client can connect using those credentials.
+- **SFTP failures**: Test SFTP connection manually to verify credentials and connectivity.
+
+### Secure Storage of Passwords
+For production use, consider more secure ways to store credentials:
+- Use environment variables
+- Implement a secure password vault
+- Set appropriate file permissions (chmod 600) for configuration files
 
 ## 👥 Contributing
 Contributions are welcome. Please open an issue or pull request in this repository.
 
 ## 📄 License
 This project is licensed under the MIT License.
+
+## 🔄 Version History
+- **v1.0.0** - Initial release
