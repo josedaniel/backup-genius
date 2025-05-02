@@ -25,6 +25,7 @@ This file defines the backup projects. Each project includes:
 - **sftp_host**: SFTP server host.
 - **sftp_username**: SFTP server username.
 - **sftp_password**: SFTP server password.
+- **sftp_route**: Path on the SFTP server to store backups.
 - **frecuency**: Frequency in minutes between backups.
 
 ##### Example Configuration:
@@ -52,6 +53,7 @@ This file defines the backup projects. Each project includes:
     "sftp_host": "backup.example.com",
     "sftp_username": "backup_user",
     "sftp_password": "sftp_password",
+    "sftp_route": "/backups/websites",
     "frecuency": 1440
   }
 ]
@@ -59,8 +61,7 @@ This file defines the backup projects. Each project includes:
 
 #### `options.json`
 This file defines general options for the backup process:
-- **sqlite_enable**: Enable or disable logging in a local SQLite database.
-- **sqlite_file**: Path to store the SQLite file.
+- **sqlite_file**: Path to store the SQLite database file for logging.
 - **msteams_enable**: Enable or disable notifications in Microsoft Teams.
 - **msteams_webhook_uri**: Microsoft Teams webhook URI.
 - **slack_enable**: Enable or disable notifications in Slack.
@@ -71,7 +72,6 @@ This file defines general options for the backup process:
 ##### Example Configuration:
 ```json
 {
-  "sqlite_enable": true,
   "sqlite_file": "/var/log/backup-genius/backups.db",
   "msteams_enable": true,
   "msteams_webhook_uri": "https://outlook.office.com/webhook/...",
@@ -84,12 +84,12 @@ This file defines general options for the backup process:
 
 ## 🔄 Backup Logic
 1. For each entry in `backup-config.json`, a ZIP file is created containing the configured files, folders, and databases.
-2. The ZIP files are named using the project name and a timestamp (e.g., `my_website_2025-04-28_132045.zip`).
+2. The ZIP files are named using the project name and a timestamp (e.g., `my_website_20250502_132045.zip`).
 3. The ZIP files are stored in the configured location.
 4. Backup files are deleted only after:
    - Being successfully uploaded.
    - Notifications are sent (if enabled).
-   - Logged in the SQLite database (if enabled).
+   - Logged in the SQLite database.
 
 ## 🚀 Installation
 
@@ -131,30 +131,30 @@ The following dependencies are required to run backup-genius:
 - **jq** - Required for processing JSON configuration files
 - **zip** - Required for creating backup archives
 - **curl** - Used for sending notifications to MS Teams and Slack
+- **sqlite3** - Required for logging backup information
+- **rsync** - Used for copying folders efficiently
 
 Depending on your configuration, you may also need:
 
-- **sqlite3** - Required if `sqlite_enable` is set to `true` in `options.json`
 - **mysqldump** - Required if you're backing up MySQL databases
-- **sftp** - Required if you're using SFTP to upload backup files
-- **expect** - Required for automated SFTP uploads using passwords
+- **lftp** - Required if you're using SFTP to upload backup files
 
 ### Installing dependencies
 
 #### On Debian/Ubuntu
 ```bash
 sudo apt-get update
-sudo apt-get install jq zip curl sqlite3 mysql-client expect
+sudo apt-get install jq zip curl sqlite3 rsync mysql-client lftp
 ```
 
 #### On macOS (using Homebrew)
 ```bash
-brew install jq zip curl sqlite mysql expect
+brew install jq zip curl sqlite rsync mysql lftp
 ```
 
 #### On CentOS/RHEL
 ```bash
-sudo yum install jq zip curl sqlite mysql-client expect
+sudo yum install jq zip curl sqlite rsync mysql-client lftp
 ```
 
 ## 📋 Usage
@@ -167,9 +167,6 @@ sudo yum install jq zip curl sqlite mysql-client expect
 
 ## 💡 Tips and Troubleshooting
 
-### Log Files
-The script creates log files in the backup location folder. Check these logs if you encounter any issues.
-
 ### Common Issues
 - **Permission errors**: Ensure the script has necessary permissions to access all files and folders.
 - **MySQL connection issues**: Verify database credentials and that the mysql-client can connect using those credentials.
@@ -180,6 +177,11 @@ For production use, consider more secure ways to store credentials:
 - Use environment variables
 - Implement a secure password vault
 - Set appropriate file permissions (chmod 600) for configuration files
+
+### Backup Frequency
+- Use `-1` for frequency to force a backup to run every time
+- Use `0` for frequency to run backup only once (if no successful backup exists)
+- Use any positive number for minutes between backups
 
 ## 👥 Contributing
 Contributions are welcome. Please open an issue or pull request in this repository.
